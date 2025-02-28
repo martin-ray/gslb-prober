@@ -1,0 +1,15 @@
+current_serial: 2024023557
+gslb_domains:
+    - domain_name: blog
+      uuid: abcd-1234-5678
+      endpoints:
+        - ip: 162.43.53.234
+          port: 443
+          host_header: blog.ingenboy.com
+          hc_path: ""
+          is_healthy: true
+          is_https: true
+      hc_interval_sec: 2
+      timeout_sec: 5
+      password: supersecret
+      ttl: 30
