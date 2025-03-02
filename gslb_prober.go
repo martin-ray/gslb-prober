@@ -12,8 +12,11 @@ import (
 	"time"
 	"net/http"
 	"crypto/tls"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Endpoint struct {
@@ -25,6 +28,18 @@ type Endpoint struct {
 	IsHTTPS    bool   `yaml:"is_https"`  // 追加: HTTPS ヘルスチェック対応
 }
 
+var healthStatus = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "endpoint_health_status",
+		Help: "Health status of endpoints (1 = healthy, 0 = unhealthy)",
+	},
+	[]string{"ip", "port", "host_header", "hc_path"},
+)
+
+func init() {
+	// Register the metric
+	prometheus.MustRegister(healthStatus)
+}
 
 // GSLB_Domain: 監視対象のドメイン情報
 type GSLB_Domain struct {
@@ -42,6 +57,22 @@ type Prober struct {
 	CurrentSerial int64          `yaml:"current_serial"`
 	GSLB_Domains  []GSLB_Domain  `yaml:"gslb_domains"`
 	mu            sync.Mutex
+}
+
+// Update the Prometheus metric
+func (p *Prober) updateMetrics() {
+	for {
+		time.Sleep(1 * time.Second)
+		for _, domain := range p.GSLB_Domains {
+			for _, ep := range domain.Endpoints {
+				value := 0.0
+				if ep.IsHealthy {
+					value = 1.0
+				}
+				healthStatus.WithLabelValues(ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath).Set(value)
+			}
+		}
+	}
 }
 
 // YAML 設定ファイルのパス
@@ -211,7 +242,7 @@ func (p *Prober) UpdateZoneFile() {
 		// ゾーンファイルのヘッダー部分を定義
 		zoneData.WriteString("$ORIGIN workers-bub.com.\n")
 		zoneData.WriteString("$TTL 30\n")
-		zoneData.WriteString(fmt.Sprintf("@   IN  SOA ns01.workers-bub.com. admin.workers-bub.com. (\n"+
+		zoneData.WriteString(fmt.Sprintf("@   IN  SOA ns02.workers-bub.com. ns01.workers-bub.com. (\n"+
 			"                %d ; Serial\n"+
 			"                7200       ; Refresh\n"+
 			"                3600       ; Retry\n"+
@@ -221,6 +252,8 @@ func (p *Prober) UpdateZoneFile() {
 		// NS レコードを追加
 		zoneData.WriteString("@   IN  NS  ns01.workers-bub.com.\n")
 		zoneData.WriteString("@   IN  NS  ns02.workers-bub.com.\n\n")
+
+		zoneData.WriteString("ns02 86400 IN A 162.43.53.234\n")
 
 		// A レコードの追加
 		for _, domain := range p.GSLB_Domains {
@@ -305,6 +338,9 @@ func main() {
 	// Graceful Shutdown を設定
 	prober.SetupGracefulShutdown()
 
+	// HTTP ハンドラを設定
+	http.Handle("/metrics", promhttp.Handler())
+
 	// API ハンドラ登録
 	http.HandleFunc("/v1/domain/add", prober.HandleDomainAdd)
 	http.HandleFunc("/v1/domain/delete", prober.HandleDomainDelete)
@@ -313,6 +349,7 @@ func main() {
 	// 並行処理でプローバーを実行
 	go prober.Probe()
 	go prober.UpdateZoneFile()
+	go prober.updateMetrics();
 
 	fmt.Println("Starting GSLB Prober server on :8080...")
 	// http.ListenAndServe(":8080", nil)
