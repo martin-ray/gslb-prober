@@ -5,35 +5,68 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"net"
 	"net/http"
 	"crypto/tls"
 	"strconv"
+	"io"
 
 	"gopkg.in/yaml.v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/go-ping/ping"
 )
 
-type Endpoint struct {
-	IP         string `yaml:"ip"`
-	PORT       int    `yaml:"port"`
-	HOST_HEADER string `yaml:"host_header"`
-	HCPath     string `yaml:"hc_path"`
-	IsHealthy  bool   `yaml:"is_healthy"`
-	IsHTTPS    bool   `yaml:"is_https"`  // 追加: HTTPS ヘルスチェック対応
+// ヘルスチェックの種類
+type HC_type int
+
+const (
+	HTTP HC_type = iota  // 0
+	HTTPS               // 1
+	TCP                 // 2
+	ICMP                // 3
+)
+
+// HC_type を文字列で出力できるようにする
+func (h HC_type) String() string {
+	switch h {
+	case HTTP:
+		return "HTTP"
+	case HTTPS:
+		return "HTTPS"
+	case TCP:
+		return "TCP"
+	case ICMP:
+		return "ICMP"
+	default:
+		return "Unknown"
+	}
 }
+
+// Endpoint 構造体
+type Endpoint struct {
+	IP         string  `yaml:"ip"`
+	PORT       int     `yaml:"port"`
+	HOST_HEADER string `yaml:"host_header"`
+	HCPath     string  `yaml:"hc_path"`
+	IsHealthy  bool    `yaml:"is_healthy"`
+	HCType     HC_type `yaml:"hc_type"` // 追加: ヘルスチェックの種類
+}
+
+
 
 var healthStatus = prometheus.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: "endpoint_health_status",
 		Help: "Health status of endpoints (1 = healthy, 0 = unhealthy)",
 	},
-	[]string{"ip", "port", "host_header", "hc_path"},
+	[]string{"ip", "port", "host_header", "hc_path", "hc_type"},
 )
 
 func init() {
@@ -69,7 +102,7 @@ func (p *Prober) updateMetrics() {
 				if ep.IsHealthy {
 					value = 1.0
 				}
-				healthStatus.WithLabelValues(ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath).Set(value)
+				healthStatus.WithLabelValues(ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()).Set(value)
 			}
 		}
 	}
@@ -171,63 +204,120 @@ func (p *Prober) Probe() {
 
 // 各エンドポイントのヘルスチェックを実行
 func (p *Prober) ProbeDomain(domainIndex int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	domain := &p.GSLB_Domains[domainIndex]
 
 	for i, ep := range domain.Endpoints {
-		scheme := "http"
-		if ep.IsHTTPS {
-			scheme = "https"
-		}
-
-		url := fmt.Sprintf("%s://%s:%d%s", scheme, ep.IP, ep.PORT, ep.HCPath)
-
-		// HTTP クライアントを作成（HTTPS の場合は証明書の検証を無効化）
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: ep.IsHTTPS}, // 🔥 証明書の検証をスキップ
-		}
-		client := http.Client{
-			Timeout:   time.Duration(domain.TimeoutSec) * time.Second,
-			Transport: tr,
-		}
-
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			fmt.Printf("🚨 [ERROR] Failed to create request for %s: %v\n", url, err)
+		switch ep.HCType {
+		case HTTP, HTTPS:
+			p.checkHTTPHealth(&domain.Endpoints[i], domain.TimeoutSec)
+		case TCP:
+			p.checkTCPHealth(&domain.Endpoints[i], domain.TimeoutSec)
+		case ICMP:
+			p.checkICMPHealth(&domain.Endpoints[i], domain.TimeoutSec)
+		default:
+			fmt.Printf("⚠️ [WARNING] Unsupported HCType for %s [%s]\n", domain.DomainName, ep.IP)
 			domain.Endpoints[i].IsHealthy = false
-			continue
 		}
-
-		// Host ヘッダーが設定されている場合は追加
-		if ep.HOST_HEADER != "" {
-			req.Host = ep.HOST_HEADER
-		}
-
-		// 送信するリクエストの詳細をログに出力
-		fmt.Printf("🔎 [DEBUG] Sending HC request: %s (Host: %s)\n", url, req.Host)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Printf("❌ [ERROR] Health check request failed for %s [%s]: %v\n", domain.DomainName, ep.IP, err)
-			domain.Endpoints[i].IsHealthy = false
-			continue
-		}
-		defer resp.Body.Close()
-
-		// HTTP ステータスコードが 200 でない場合、詳細を出力
-		if resp.StatusCode != 200 {
-			body, _ := ioutil.ReadAll(resp.Body) // レスポンスの内容も取得
-			fmt.Printf("[ERROR] Health check failed: %s [%s] Status %d\nResponse: %s\n", domain.DomainName, ep.IP, resp.StatusCode, string(body))
-			domain.Endpoints[i].IsHealthy = false
-			continue
-		}
-
-		fmt.Printf("[SUCCESS] Healthy: %s [%s] Status %d\n", domain.DomainName, ep.IP, resp.StatusCode)
-		domain.Endpoints[i].IsHealthy = true
 	}
 }
+
+// HTTP(S) ヘルスチェック
+func (p *Prober) checkHTTPHealth(ep *Endpoint, timeout int) {
+	scheme := "http"
+	if ep.HCType == HTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d%s", scheme, ep.IP, ep.PORT, ep.HCPath)
+
+	// HTTP クライアントを作成（HTTPS の場合は証明書の検証を無効化）
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: ep.HCType == HTTPS}, // 証明書の検証をスキップ
+	}
+	client := http.Client{
+		Timeout:   time.Duration(timeout) * time.Second,
+		Transport: tr,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Printf("🚨 [ERROR] Failed to create request for %s: %v\n", url, err)
+		ep.IsHealthy = false
+		return
+	}
+
+	// Host ヘッダーが設定されている場合は追加
+	if ep.HOST_HEADER != "" {
+		req.Host = ep.HOST_HEADER
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("❌ [ERROR] Health check request failed for %s [%s]: %v\n", ep.IP, url, err)
+		ep.IsHealthy = false
+		return
+	}
+	defer resp.Body.Close()
+
+	// HTTP ステータスコードが 200 でない場合、詳細を出力
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("[ERROR] Health check failed: %s [%s] Status %d\nResponse: %s\n", ep.IP, url, resp.StatusCode, string(body))
+		ep.IsHealthy = false
+		return
+	}
+
+	fmt.Printf("[SUCCESS] HTTP(s)Healthy: %s [%s] Status %d\n", ep.IP, url, resp.StatusCode)
+	ep.IsHealthy = true
+}
+
+// TCP ヘルスチェック
+func (p *Prober) checkTCPHealth(ep *Endpoint, timeout int) {
+	address := fmt.Sprintf("%s:%d", ep.IP, ep.PORT)
+
+	conn, err := net.DialTimeout("tcp", address, time.Duration(timeout)*time.Second)
+	if err != nil {
+		fmt.Printf("❌ [ERROR] TCP health check failed for %s [%s]: %v\n", ep.IP, address, err)
+		ep.IsHealthy = false
+		return
+	}
+	defer conn.Close()
+
+	fmt.Printf("[SUCCESS] TCP Healthy: %s [%s]\n", ep.IP, address)
+	ep.IsHealthy = true
+}
+
+// ICMP (Ping) ヘルスチェック
+func (p *Prober) checkICMPHealth(ep *Endpoint, timeout int) {
+	pinger, err := ping.NewPinger(ep.IP)
+	if err != nil {
+		fmt.Printf("❌ [ERROR] ICMP health check failed for %s [%s]: %v\n", ep.IP, ep.IP, err)
+		ep.IsHealthy = false
+		return
+	}
+
+	pinger.Count = 3                   // 3回Pingを送信
+	pinger.Timeout = time.Duration(timeout) * time.Second
+	pinger.SetPrivileged(true) // root 権限が必要な場合は true
+
+	err = pinger.Run()
+	if err != nil {
+		fmt.Printf("❌ [ERROR] ICMP ping failed for %s [%s]: %v\n", ep.IP, ep.IP, err)
+		ep.IsHealthy = false
+		return
+	}
+
+	stats := pinger.Statistics()
+	if stats.PacketLoss == 100 {
+		fmt.Printf("❌ [ERROR] ICMP health check failed (100%% packet loss) for %s [%s]\n", ep.IP, ep.IP)
+		ep.IsHealthy = false
+		return
+	}
+
+	fmt.Printf("[SUCCESS] ICMP Healthy: %s [%s], Avg RTT: %v\n", ep.IP, ep.IP, stats.AvgRtt)
+	ep.IsHealthy = true
+}
+
 
 
 
