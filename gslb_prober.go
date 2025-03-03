@@ -66,7 +66,7 @@ var healthStatus = prometheus.NewGaugeVec(
 		Name: "endpoint_health_status",
 		Help: "Health status of endpoints (1 = healthy, 0 = unhealthy)",
 	},
-	[]string{"ip", "port", "host_header", "hc_path", "hc_type"},
+	[]string{"domain", "ip", "port", "host_header", "hc_path", "hc_type"},
 )
 
 func init() {
@@ -104,7 +104,7 @@ func (p *Prober) updateMetrics() {
 				if ep.IsHealthy {
 					value = 1.0
 				}
-				healthStatus.WithLabelValues(ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()).Set(value)
+				healthStatus.WithLabelValues(domain.DomainName,ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()).Set(value)
 			}
 		}
 	}
@@ -449,7 +449,7 @@ func main() {
 	prober.SetupGracefulShutdown()
 
 	// HTTP ハンドラを設定
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/very/string/passowrd/hogehoge/metrics", promhttp.Handler())
 
 	// API ハンドラ登録
 	http.HandleFunc("/v1/domain/add", prober.HandleDomainAdd)
