@@ -92,6 +92,8 @@ type Prober struct {
 	mu            sync.Mutex
 }
 
+var LastZoneData  string // Stores the last written zone file content in memory
+
 // Update the Prometheus metric
 func (p *Prober) updateMetrics() {
 	for {
@@ -110,6 +112,8 @@ func (p *Prober) updateMetrics() {
 
 // YAML 設定ファイルのパス
 const configFile = "gslb_config.yml"
+
+const zoneFilePath = "/etc/coredns/zones/workers-bub.com.zone"
 
 // 設定ファイルを読み込む
 func (p *Prober) LoadConfig() error {
@@ -321,31 +325,35 @@ func (p *Prober) checkICMPHealth(ep *Endpoint, timeout int) {
 
 
 
-// ゾーンファイルを更新
+// UpdateZoneFile updates the zone file only when there is a difference
 func (p *Prober) UpdateZoneFile() {
 	for {
 		time.Sleep(1 * time.Second)
 
 		p.mu.Lock()
+
+		// Contents which does not get affected by the hc result
+		var zoneHeader strings.Builder
+
+		// Contents which get affected by hc result
 		var zoneData strings.Builder
 
-		// ゾーンファイルのヘッダー部分を定義
-		zoneData.WriteString("$ORIGIN workers-bub.com.\n")
-		zoneData.WriteString("$TTL 30\n")
-		zoneData.WriteString(fmt.Sprintf("@   IN  SOA ns02.workers-bub.com. ns01.workers-bub.com. (\n"+
+		zoneHeader.WriteString("$ORIGIN workers-bub.com.\n")
+		zoneHeader.WriteString("$TTL 30\n")
+		zoneHeader.WriteString(fmt.Sprintf("@   IN  SOA ns02.workers-bub.com. ns01.workers-bub.com. (\n"+
 			"                %d ; Serial\n"+
 			"                7200       ; Refresh\n"+
 			"                3600       ; Retry\n"+
 			"                1209600    ; Expire\n"+
 			"                30 )       ; Minimum TTL\n\n", p.CurrentSerial))
 
-		// NS レコードを追加
-		zoneData.WriteString("@   IN  NS  ns01.workers-bub.com.\n")
-		zoneData.WriteString("@   IN  NS  ns02.workers-bub.com.\n\n")
+		// NS records
+		zoneHeader.WriteString("@   IN  NS  ns01.workers-bub.com.\n")
+		zoneHeader.WriteString("@   IN  NS  ns02.workers-bub.com.\n\n")
 
-		zoneData.WriteString("ns02 86400 IN A 162.43.53.234\n")
+		zoneHeader.WriteString("ns02 86400 IN A 162.43.53.234\n")
 
-		// A レコードの追加
+		// A records
 		for _, domain := range p.GSLB_Domains {
 			for _, ep := range domain.Endpoints {
 				if ep.IsHealthy {
@@ -354,19 +362,31 @@ func (p *Prober) UpdateZoneFile() {
 			}
 		}
 
-		// ゾーンファイルを更新
-		err := ioutil.WriteFile("/etc/coredns/zones/workers-bub.com.zone", []byte(zoneData.String()), 0644)
+		newZoneContent := zoneData.String()
+
+		// Compare with last stored zone data
+		if LastZoneData == newZoneContent {
+			// No changes, skip update
+			fmt.Println("No changes in the zone file, skipping update")
+			p.mu.Unlock()
+			continue
+		}
+
+		zoneHeader.WriteString(newZoneContent)
+
+		// Write the new content to the file
+		err := ioutil.WriteFile(zoneFilePath, []byte(zoneHeader.String()), 0644)
 		if err != nil {
 			fmt.Println("Failed to update zone file:", err)
 		} else {
 			fmt.Println("Updated zone file")
+			p.CurrentSerial++               // Increment the serial only if the file was updated
+			LastZoneData = newZoneContent // Store the new content in memory
 		}
 
-		p.CurrentSerial++
 		p.mu.Unlock()
 	}
 }
-
 
 // API ハンドラー (ドメイン追加)
 func (p *Prober) HandleDomainAdd(w http.ResponseWriter, r *http.Request) {
