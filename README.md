@@ -41,7 +41,6 @@ curl -X POST "http://162.43.53.234:8089/v1/domain/add"      -H "Content-Type: ap
             "PORT": 443,
             "HOST_HEADER": "umurphy.com",
             "HCPath": "",
-            "IsHealthy": true,
             "HCType": 2
           }
         ],
@@ -65,7 +64,6 @@ curl -X POST "http://162.43.53.234:8089/v1/domain/add"      -H "Content-Type: ap
             "PORT": 443,
             "HOST_HEADER": "umurphy.com",
             "HCPath": "",
-            "IsHealthy": true,
             "HCType": 2
           }
         ],
