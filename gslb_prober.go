@@ -16,11 +16,15 @@ import (
 	"crypto/tls"
 	"strconv"
 	"io"
+	"crypto/sha256"
+	"encoding/hex"
+	
 
 	"gopkg.in/yaml.v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/go-ping/ping"
+	"github.com/google/uuid"
 )
 
 // ヘルスチェックの種類
@@ -176,6 +180,13 @@ func (p *Prober) DeleteDomainByName(pass string, domainName string) {
 			return
 		}
 	}
+}
+
+// エンドポイントを追加
+func (p *Prober) AddNewEP(g GSLB_Domain) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.GSLB_Domains = append(p.GSLB_Domains, g)
 }
 
 // Graceful Shutdown（Ctrl + C で終了時に設定を保存）
@@ -362,17 +373,17 @@ func (p *Prober) UpdateZoneFile() {
 			}
 		}
 
-		newZoneContent := zoneData.String()
+		newZoneData := zoneData.String()
 
 		// Compare with last stored zone data
-		if LastZoneData == newZoneContent {
+		if LastZoneData == newZoneData {
 			// No changes, skip update
 			fmt.Println("No changes in the zone file, skipping update")
 			p.mu.Unlock()
 			continue
 		}
 
-		zoneHeader.WriteString(newZoneContent)
+		zoneHeader.WriteString(newZoneData)
 
 		// Write the new content to the file
 		err := ioutil.WriteFile(zoneFilePath, []byte(zoneHeader.String()), 0644)
@@ -381,7 +392,7 @@ func (p *Prober) UpdateZoneFile() {
 		} else {
 			fmt.Println("Updated zone file")
 			p.CurrentSerial++               // Increment the serial only if the file was updated
-			LastZoneData = newZoneContent // Store the new content in memory
+			LastZoneData = newZoneData // Store the new content in memory
 		}
 
 		p.mu.Unlock()
@@ -395,13 +406,39 @@ func (p *Prober) HandleDomainAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var domain GSLB_Domain
-	if err := json.NewDecoder(r.Body).Decode(&domain); err != nil {
+	var newDomain GSLB_Domain
+	if err := json.NewDecoder(r.Body).Decode(&newDomain); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	p.AddNewDomain(domain)
+	// パスワードをSHA-256でハッシュ化して文字列に変換
+	hash := sha256.Sum256([]byte(newDomain.Password))
+	newDomain.Password = hex.EncodeToString(hash[:])
+
+	newDomain.UUID = uuid.New().String()
+
+	// 既に存在するドメインかどうかを判定
+	for i, v :=  range p.GSLB_Domains {
+		if v.DomainName == newDomain.DomainName {
+			
+			// パスワードが一致しない
+			if v.Password != newDomain.Password {
+				// 
+				http.Error(w, "Authorization failed", http.StatusUnauthorized)
+				return
+			}
+
+			// パスワードが一致
+			p.GSLB_Domains[i].Endpoints = append(p.GSLB_Domains[i].Endpoints, newDomain.Endpoints...)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, "Domain added")
+			return
+		} 
+	}
+
+	// 存在しないドメインなので、普通に追加
+	p.AddNewDomain(newDomain)
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(w, "Domain added")
 }
@@ -435,6 +472,7 @@ func (p *Prober) HandleDomainList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p.GSLB_Domains)
 }
+
 
 func main() {
 	prober := &Prober{
