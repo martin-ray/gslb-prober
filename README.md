@@ -51,6 +51,7 @@ curl -X POST "http://162.43.53.234:8089/v1/domain/add"      -H "Content-Type: ap
         "TTL": 5
      }'
 ```
+The password registered here will be stored as sha256 and will be used to update/delete/add EP later as described in the following document.
 
 ## add new EP to domain
 assume exmaple(.workers-bub.com) is already added to the GSLB doamin
