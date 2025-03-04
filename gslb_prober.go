@@ -375,6 +375,9 @@ func (p *Prober) UpdateZoneFile() {
 
 		newZoneData := zoneData.String()
 
+		fmt.Printf(newZoneData)
+		fmt.Printf(LastZoneData)
+
 		// Compare with last stored zone data
 		if LastZoneData == newZoneData {
 			// No changes, skip update
@@ -385,8 +388,9 @@ func (p *Prober) UpdateZoneFile() {
 
 		zoneHeader.WriteString(newZoneData)
 
-		// Write the new content to the file
+		// Write the new content to the file (OSがフラッシュタイミングを決めるため、すぐに書き込まれない可能性がある)
 		err := ioutil.WriteFile(zoneFilePath, []byte(zoneHeader.String()), 0644)
+		
 		if err != nil {
 			fmt.Println("Failed to update zone file:", err)
 		} else {
@@ -450,18 +454,38 @@ func (p *Prober) HandleDomainDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := r.URL.Query()
-	pass := query.Get("password")
-	domainName := query.Get("domain")
-
-	if pass == "" || domainName == "" {
-		http.Error(w, "Missing parameters", http.StatusBadRequest)
+	var DeletingDomain GSLB_Domain
+	if err := json.NewDecoder(r.Body).Decode(&DeletingDomain); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	p.DeleteDomainByName(pass, domainName)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Domain deleted")
+	// パスワードをSHA-256でハッシュ化して文字列に変換
+	hash := sha256.Sum256([]byte(DeletingDomain.Password))
+	DeletingDomain.Password = hex.EncodeToString(hash[:])
+
+	// 既に存在するドメインかどうかを判定
+	for i, v :=  range p.GSLB_Domains {
+		if v.DomainName == DeletingDomain.DomainName {
+			
+			// パスワードが一致しない
+			if v.Password != DeletingDomain.Password {
+				// 
+				http.Error(w, "Authorization failed", http.StatusUnauthorized)
+				return
+			}
+
+			// パスワードが一致
+			p.GSLB_Domains = append(p.GSLB_Domains[:i], p.GSLB_Domains[i+1:]...)
+			w.WriteHeader(http.StatusOK) // 200: OK
+			fmt.Fprintf(w, "Domain deleted")			
+			return
+		} 
+	}
+
+	// ドメインが存在しないので消せない
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintf(w, "Domain does not exist")
 }
 
 // API ハンドラー (ドメインリスト取得)
