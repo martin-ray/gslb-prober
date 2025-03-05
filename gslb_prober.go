@@ -93,6 +93,7 @@ type GSLB_Domain struct {
 type Prober struct {
 	CurrentSerial int64          `yaml:"current_serial"`
 	GSLB_Domains  []GSLB_Domain  `yaml:"gslb_domains"`
+	activeMetrics map[string]bool
 	mu            sync.Mutex
 }
 
@@ -100,6 +101,8 @@ var LastZoneData  string // Stores the last written zone file content in memory
 
 // Update the Prometheus metric
 func (p *Prober) updateMetrics() {
+
+	p.activeMetrics = make(map[string]bool)
 	for {
 		time.Sleep(1 * time.Second)
 		for _, domain := range p.GSLB_Domains {
@@ -108,7 +111,14 @@ func (p *Prober) updateMetrics() {
 				if ep.IsHealthy {
 					value = 1.0
 				}
+
+				labels := []string{domain.DomainName, ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()}
+				// healthStatus.WithLabelValues(labels...).Set(value)
 				healthStatus.WithLabelValues(domain.DomainName,ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()).Set(value)
+				
+				// activeMetrics に登録（`true` にすることで明示的に管理）
+				key := strings.Join(labels, ",")
+				p.activeMetrics[key] = true
 			}
 		}
 	}
@@ -282,7 +292,7 @@ func (p *Prober) checkHTTPHealth(ep *Endpoint, timeout int) {
 		return
 	}
 
-	fmt.Printf("[SUCCESS] HTTP(s)Healthy: %s [%s] Status %d\n", ep.IP, url, resp.StatusCode)
+	// fmt.Printf("[SUCCESS] HTTP(s)Healthy: %s [%s] Status %d\n", ep.IP, url, resp.StatusCode)
 	ep.IsHealthy = true
 }
 
@@ -298,7 +308,7 @@ func (p *Prober) checkTCPHealth(ep *Endpoint, timeout int) {
 	}
 	defer conn.Close()
 
-	fmt.Printf("[SUCCESS] TCP Healthy: %s [%s]\n", ep.IP, address)
+	// fmt.Printf("[SUCCESS] TCP Healthy: %s [%s]\n", ep.IP, address)
 	ep.IsHealthy = true
 }
 
@@ -329,7 +339,7 @@ func (p *Prober) checkICMPHealth(ep *Endpoint, timeout int) {
 		return
 	}
 
-	fmt.Printf("[SUCCESS] ICMP Healthy: %s [%s], Avg RTT: %v\n", ep.IP, ep.IP, stats.AvgRtt)
+	// fmt.Printf("[SUCCESS] ICMP Healthy: %s [%s], Avg RTT: %v\n", ep.IP, ep.IP, stats.AvgRtt)
 	ep.IsHealthy = true
 }
 
@@ -351,7 +361,7 @@ func (p *Prober) UpdateZoneFile() {
 
 		zoneHeader.WriteString("$ORIGIN workers-bub.com.\n")
 		zoneHeader.WriteString("$TTL 30\n")
-		zoneHeader.WriteString(fmt.Sprintf("@   IN  SOA ns02.workers-bub.com. ns01.workers-bub.com. (\n"+
+		zoneHeader.WriteString(fmt.Sprintf("@   IN  SOA ns02.workers-bub.com. admin.workers-bub.com. (\n"+
 			"                %d ; Serial\n"+
 			"                7200       ; Refresh\n"+
 			"                3600       ; Retry\n"+
@@ -359,7 +369,7 @@ func (p *Prober) UpdateZoneFile() {
 			"                30 )       ; Minimum TTL\n\n", p.CurrentSerial))
 
 		// NS records
-		zoneHeader.WriteString("@   IN  NS  ns01.workers-bub.com.\n")
+		// zoneHeader.WriteString("@   IN  NS  ns01.workers-bub.com.\n")
 		zoneHeader.WriteString("@   IN  NS  ns02.workers-bub.com.\n\n")
 
 		zoneHeader.WriteString("ns02 86400 IN A 162.43.53.234\n")
@@ -375,13 +385,13 @@ func (p *Prober) UpdateZoneFile() {
 
 		newZoneData := zoneData.String()
 
-		fmt.Printf(newZoneData)
-		fmt.Printf(LastZoneData)
+		// fmt.Printf(newZoneData)
+		// fmt.Printf(LastZoneData)
 
 		// Compare with last stored zone data
 		if LastZoneData == newZoneData {
 			// No changes, skip update
-			fmt.Println("No changes in the zone file, skipping update")
+			// fmt.Println("No changes in the zone file, skipping update")
 			p.mu.Unlock()
 			continue
 		}
@@ -456,9 +466,9 @@ func (p *Prober) HandleDomainDelete(w http.ResponseWriter, r *http.Request) {
 
 	var DeletingDomain GSLB_Domain
 	if err := json.NewDecoder(r.Body).Decode(&DeletingDomain); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
 		return
-	}
+	}	
 
 	// パスワードをSHA-256でハッシュ化して文字列に変換
 	hash := sha256.Sum256([]byte(DeletingDomain.Password))
@@ -476,6 +486,24 @@ func (p *Prober) HandleDomainDelete(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// パスワードが一致
+
+			// メトリクス削除処理
+			for _, ep := range v.Endpoints {
+				labels := prometheus.Labels{
+					"domain":      v.DomainName,
+					"ip":          ep.IP,
+					"port":        strconv.Itoa(ep.PORT),
+					"host_header": ep.HOST_HEADER,
+					"hc_path":     ep.HCPath,
+					"hc_type":     ep.HCType.String(),
+				}
+				healthStatus.Delete(labels)
+
+				// activeMetrics からも削除
+				key := strings.Join([]string{v.DomainName, ep.IP, strconv.Itoa(ep.PORT), ep.HOST_HEADER, ep.HCPath, ep.HCType.String()}, ",")
+				delete(p.activeMetrics, key) // ✅ `delete()` で削除
+			}
+			
 			p.GSLB_Domains = append(p.GSLB_Domains[:i], p.GSLB_Domains[i+1:]...)
 			w.WriteHeader(http.StatusOK) // 200: OK
 			fmt.Fprintf(w, "Domain deleted")			
