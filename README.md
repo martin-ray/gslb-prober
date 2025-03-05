@@ -80,7 +80,7 @@ ensure the Password is same as the one you registered when creating the domain.
 assume exmaple(.workers-bub.com) is the existing GSLB doamin
 
 ```
-curl -X POST "http://162.43.53.234:8089/v1/domain/delete"      -H "Content-Type: application/json"      -d '{
+curl -X DELETE "http://162.43.53.234:8089/v1/domain/delete"      -H "Content-Type: application/json"      -d '{
         "DomainName": "exmaple",
         "Password": "supersecret"
      }'
